@@ -1,0 +1,241 @@
+---
+- name: Deploiement et durcissement de la todolist
+  hosts: my_infra
+  become: true
+  vars:
+    app_user: todolist
+    app_home: /opt/todolist
+    app_dir: /opt/todolist/app
+    venv_dir: /opt/todolist/venv
+    repo_url: https://github.com/fersiamir/to-do-list-unsecure.git
+    app_port: 8000
+
+  tasks:
+    # ---------- Mises à jour (ex. 16) ----------
+    - name: Mise à jour des paquets
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: safe
+        cache_valid_time: 3600
+      tags: [updates]
+
+    - name: Installation des paquets nécessaires
+      ansible.builtin.apt:
+        name:
+          - python3
+          - python3-venv
+          - python3-pip
+          - git
+          - acl
+          - ufw
+          - unattended-upgrades
+        state: present
+
+    - name: Activation des mises à jour automatiques de sécurité
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+      tags: [updates]
+
+    # ---------- Utilisateur dédié (ex. 17) ----------
+    - name: Création de l'utilisateur applicatif sans droits admin
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: "{{ app_home }}"
+        create_home: true
+
+    # ---------- Déploiement de l'app (ex. 8, 9) ----------
+    - name: Clone du dépôt (branche main)
+      ansible.builtin.git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_dir }}"
+        version: "{{ app_branch | default('main') }}"
+        force: true
+      become_user: "{{ app_user }}"
+
+    - name: Création du virtualenv et installation des dépendances
+      ansible.builtin.pip:
+        name:
+          - django
+          - gunicorn
+          - pyyaml
+        virtualenv: "{{ venv_dir }}"
+        virtualenv_command: python3 -m venv
+      become_user: "{{ app_user }}"
+    # ---------- Variables selon l'environnement (ex. 12) ----------
+    - name: Réglage de DEBUG selon l'hôte
+      ansible.builtin.lineinfile:
+        path: "{{ app_dir }}/todo/settings.py"
+        regexp: '^DEBUG\s*='
+        line: "DEBUG = {{ django_debug | default('True') }}"
+      become_user: "{{ app_user }}"
+      notify: Restart todolist
+
+    - name: ALLOWED_HOSTS
+      ansible.builtin.lineinfile:
+        path: "{{ app_dir }}/todo/settings.py"
+        regexp: '^ALLOWED_HOSTS\s*='
+        line: "ALLOWED_HOSTS = ['*']"
+      become_user: "{{ app_user }}"
+      notify: Restart todolist
+
+    - name: Migrations Django
+      ansible.builtin.command:
+        cmd: "{{ venv_dir }}/bin/python manage.py migrate --noinput"
+        chdir: "{{ app_dir }}"
+      become_user: "{{ app_user }}"
+      changed_when: false
+
+    # ---------- Service systemd (ex. 13 + 17) ----------
+    - name: Service systemd todolist
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/todolist.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Todolist Gunicorn
+          After=network.target
+
+          [Service]
+          User={{ app_user }}
+          Group={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          ExecStart={{ venv_dir }}/bin/gunicorn --bind 0.0.0.0:{{ app_port }} todo.wsgi:application
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart todolist
+
+    - name: Activation et démarrage du service au boot
+      ansible.builtin.systemd:
+        name: todolist
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    # ---------- Durcissement SSH (ex. 14) ----------
+    - name: Durcissement SSH
+      block:
+        - name: Options sshd (clé uniquement, pas de root)
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?\s*{{ item.key }}\s'
+            line: "{{ item.key }} {{ item.value }}"
+            validate: /usr/sbin/sshd -t -f %s
+          loop:
+            - { key: PasswordAuthentication, value: "no" }
+            - { key: KbdInteractiveAuthentication, value: "no" }
+            - { key: PermitRootLogin, value: "no" }
+            - { key: PubkeyAuthentication, value: "yes" }
+          notify: Restart sshd
+      tags: [hardening]
+
+    # ---------- Pare-feu (ex. 15) ----------
+    - name: Pare-feu UFW
+      block:
+        - name: Autoriser SSH et l'application
+          community.general.ufw:
+            rule: allow
+            port: "{{ item }}"
+            proto: tcp
+          loop:
+            - "22"
+            - "{{ app_port }}"
+
+        - name: Politique par défaut entrante
+          community.general.ufw:
+            direction: incoming
+            policy: deny
+
+        - name: Politique par défaut sortante
+          community.general.ufw:
+            direction: outgoing
+            policy: allow
+
+        - name: Activer UFW
+          community.general.ufw:
+            state: enabled
+      tags: [hardening]
+
+    # ---------- Corrections Lynis (ex. 18) ----------
+    - name: Corrections issues du rapport Lynis
+      block:
+        - name: "Finding 1 : durcissement SSH supplémentaire"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?\s*{{ item.key }}\s'
+            line: "{{ item.key }} {{ item.value }}"
+            validate: /usr/sbin/sshd -t -f %s
+          loop:
+            - { key: MaxAuthTries, value: "3" }
+            - { key: X11Forwarding, value: "no" }
+            - { key: AllowTcpForwarding, value: "no" }
+            - { key: ClientAliveCountMax, value: "2" }
+            - { key: LogLevel, value: "VERBOSE" }
+            - { key: MaxSessions, value: "2" }
+          notify: Restart sshd
+
+        - name: "Finding 2 : fail2ban"
+          ansible.builtin.apt:
+            name: fail2ban
+            state: present
+
+        - name: "Finding 3 : debsums"
+          ansible.builtin.apt:
+            name: debsums
+            state: present
+      tags: [lynis_fixes]
+
+    # ---------- Audit Lynis (ex. 18, uniquement à la demande) ----------
+    - name: Installation de Lynis
+      ansible.builtin.apt:
+        name: lynis
+        state: present
+      tags: [never, audit]
+
+    - name: Lancement de l'audit Lynis
+      ansible.builtin.command: lynis audit system --quick --no-colors
+      failed_when: false
+      changed_when: false
+      tags: [never, audit]
+
+    - name: Lecture du score
+      ansible.builtin.shell: grep hardening_index /var/log/lynis-report.dat
+      register: lynis_score
+      changed_when: false
+      tags: [never, audit]
+
+    - name: Affichage du score
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} : {{ lynis_score.stdout }}"
+      tags: [never, audit]
+
+    # ---------- Test automatique (ex. 11) ----------
+    - name: Vérifier que l'application répond depuis mon PC
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ app_port }}"
+        status_code: 200
+      delegate_to: localhost
+      become: false
+      register: result
+      retries: 10
+      delay: 3
+      until: result.status == 200
+      tags: [test]
+
+  handlers:
+    - name: Restart todolist
+      ansible.builtin.systemd:
+        name: todolist
+        state: restarted
+
+    - name: Restart sshd
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
