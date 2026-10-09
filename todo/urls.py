@@ -1,9 +1,7 @@
-from django.urls import path
-
-from . import views
+from django.contrib import admin
+from django.urls import path, include
 
 urlpatterns = [
-    path("", views.index, name="list"),
-    path("update_task/<str:pk>/", views.updateTask, name="update_task"),
-    path("delete_task/<str:pk>/", views.deleteTask, name="delete"),
+    path('admin/', admin.site.urls),
+    path('', include('tasks.urls')),
 ]
