@@ -16,9 +16,9 @@
 			<a class="btn btn-sm btn-info" href = "{% url 'update_task' task.id %}">Update</a>
 			<a class="btn btn-sm btn-danger" href = "{% url 'delete' task.id %}">Delete</a>
 			{% if task.complete == True %}
-			<strike>{{task.title|safe}}</strike>
+			<strike>{{task.title}}</strike>
 			{% else %}
-			<span>{{task.title|safe}}</span>
+			<span>{{task.title}}</span>
 			{% endif %}
 
 		</div>
